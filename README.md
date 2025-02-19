@@ -14,3 +14,6 @@ Findings: The best ARIMA model suggested a pessimistic forecast, cautioning agai
 Comparisons to what transpired:
 
 ![image](https://github.com/user-attachments/assets/cb6f9ad3-80b9-40b1-ab43-5a2243bb6170)
+
+![image](https://github.com/user-attachments/assets/ec8ef8a7-4387-4c19-9f67-22194b59ceb2)
+
