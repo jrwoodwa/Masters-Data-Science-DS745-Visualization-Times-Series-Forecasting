@@ -1,0 +1,441 @@
+---
+title: 'DS745: Project One'
+author: "John Woodward"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    reference_docx: Word_template.docx
+    fig_height: 5
+    #fig_width: 6
+  tables:
+    style: MyTable
+bibliography: myreferences.bib
+biblio-style: apalike 
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, message=FALSE, echo=FALSE}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyr) # data cleanup
+source("my_functions.R") # gf_partialPlot and other functions
+
+# plotting
+library(RColorBrewer) # colors for correlation plot
+library(ggformula)
+library(knitr) # making format look cooler
+library(gridExtra)
+
+library(patchwork) # making cooler layouts
+
+library(forecast)
+
+library(scales)
+
+
+num_figure <- 0 ; num_table <- 0 # initialize counters
+```
+
+\newpage
+# Introduction
+
+In forecasting, for my project, I will apply the Autoregressive Integrated Moving Average (ARIMA) to five years of GameStop (GME) stock to inform whether I should sell my holdings now or wait until a better time. So, let's embark on this stocky endeavor, where seasonality and trends might predict the market's sways.
+
+# Data Preparation
+
+Although the GME stock data [@yahoo-finance] is relatively tidy and simple in column structure and size, there are nuances to it [@gamestop-stock-split]:
+
+1. `Date` - Stock exchange dates do not include all calendar dates by default.
+2. `Close` - The stock price per day at the closing time, with stock splits accounted for.
+3. `Volume` - The volume of the stock bought or sold daily, with stock splits accounted for.
+
+
+The `Close` and `Volume` have missing dates on Saturdays and Sundays because stock markets close on weekends. Therefore, I imputed `Close` by filling down as the price remains fixed over the weekend. Whereas `Volume` is typically at 0 during the offline periods when no one can trade at the stock markets, I imputed NAs to 0. The following Figure `r num_figure+1` is the before and after heatmap of missingness [@woodward2023]: 
+
+```{r, warnings=FALSE, messages=FALSE}
+# missingness heatmap code from GitHub/Prior Project
+#----------------------------------------
+
+plot_missing_data_heatmap <- function(data) {
+  # Create a missingness heatmap plot for each variable in the data
+  missing_data <- data %>%
+    mutate(across(everything(), ~ is.na(.)))
+  
+  missing_data$row_number <- seq_len(nrow(missing_data))
+  
+  # Reshape the dataframe to a long format for ggplot
+  missing_data_long <-
+    reshape2::melt(missing_data, id.vars = c("row_number"))
+  
+  # Plot the missingness heatmap using ggplot2
+  ggplot(missing_data_long,
+         aes(x = variable, 
+             y = row_number, 
+             fill = value)) +
+    geom_tile() +
+    scale_fill_manual(
+      values = c("transparent", "grey10"),
+      labels = c("Present", "Missing")
+    ) +
+    labs(x = " ", y = "Row") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 8),
+      panel.grid.major.x = element_line(color = "gray80"), # Add vertical gridlines
+      panel.grid.minor = element_blank() # Remove minor gridlines
+    ) +
+    scale_y_reverse()  # Reverse the order of y-axis labels
+}
+
+```
+
+
+```{r, dpi=3000, fig.height=4}
+GME_raw <- read_csv('GME_5YEARS.csv', 
+                    show_col_types = FALSE) %>%
+  dplyr::select(Date, Close, Volume)  %>%
+  mutate(Date = mdy(Date))  %>%
+  complete(Date = seq.Date(min(Date),
+                           max(Date),
+                           by = "1 day"))  # Create a full calendar range of dates
+
+GME <- GME_raw %>% # imputing GME data
+  fill(Close, .direction = "down") %>% # impute missing Close prices
+  mutate(Volume = replace_na(Volume, 0)) # impute missing Volume with 0
+
+
+Figure1_before <- plot_missing_data_heatmap(GME_raw)
+Figure1_after <- plot_missing_data_heatmap(GME)
+
+num_figure <- num_figure + 1
+# Arrange the plots side by side
+(Figure1_before / Figure1_after) +
+  plot_annotation(title = paste0("Figure ",
+                                 num_figure,
+                                 ': Missingness before and after imputing'))
+```
+
+Next, let's visualize the `Close` and `Volume` time series in Figure `r num_figure+1`:
+
+```{r, dpi=3200}
+plot_GME <- GME %>%
+  gf_line(Close ~ Date, 
+          color = "blue",
+          linewidth=1,
+         xlab="") +
+  geom_text(
+    data = filter(GME, Date %in% as.Date(c(
+      "2022-07-22", "2021-01-25"
+    ))),
+    aes(label = ifelse(
+      Date == as.Date("2022-07-22"),
+      "4:1 Stock Split",
+      "2021 Short Event"
+    )),
+    y = 0,
+    #vjust = 3.5,
+    hjust = 0.1,
+    color = "grey40",
+    size = 3
+  )
+
+plot_GME2 <- GME %>%
+  gf_col(log(Volume/1e6) ~ Date, 
+         fill = "black", 
+         alpha = 0.6, 
+         ylab = "log of Volume-In-1M",
+         xlab="") +
+  geom_text(
+    data = filter(GME, Date %in% as.Date(c("2021-01-25"
+    ))),
+    aes(label = "log of 789M volume"),
+    vjust = 0,
+    hjust = 0,
+    color = "grey40",
+    size = 3
+  )
+
+
+num_figure <- num_figure + 1
+
+# Arrange the plots side by side
+(plot_GME / plot_GME2) +
+  plot_annotation(title = paste0("Figure ",
+                                 num_figure,
+                                 ': GME stock (with stock splits)'))
+
+```
+
+# Forecasting with ARIMA
+
+In ARIMA forecasting and variable accounting, I included the time series of closing prices (e.g., `Close`), `Volume`, and post-transformed volume. The hypothesis behind this was that volume correlates directly to closing prices.
+
+```{r}
+
+close_ts <- ts(GME$Close, frequency = 365)
+volume_ts <- ts(GME$Volume, frequency = 365)
+volume_transformed_ts <- ts(log(GME$Volume/1e6+1), frequency = 365)
+```
+## Hyperparameter tuning/seasonality/customer lifetime value
+
+With **customer lifetime value**, I needed to learn more before applying it to data in the project; likewise, applying it in this project did not seem relevant and cohesive, so I decided not to.
+
+However, **tuning hyperparameters** and considering **seasonality** seemed appropriate given the scope. Therefore, to accomplish both, I used `auto.arima` from R's *`forecast`* library and varied my forecasting ARIMA models between four scenarios: (1) ARIMA; (2) ARIMA with coerced seasonality [@auto-arima-seasonality]; (3) #2 with exogenous variable of volume; (4) #2 with exogenous variable of volume transformed.
+
+```{r}
+
+ 
+# Auto SARIMA without exogenous variable
+# auto_sarima_model <- auto.arima(close_ts,
+#                                 #xreg = volume_ts,
+#                                 D=1, # coercing seasonality [@auto-arima-seasonality]
+#                                 #stepwise = TRUE,
+#                                 approximation = FALSE,
+#                                 trace = TRUE)
+# 
+# summary(auto_sarima_model)
+
+# Auto SARIMA with exogenous variable
+# auto_sarima_model <- auto.arima(close_ts, 
+#                                 xreg = volume_ts,
+#                                 D=1, # coercing seasonality [@auto-arima-seasonality]
+#                                 #stepwise = TRUE, 
+#                                 approximation = FALSE,
+#                                 trace = TRUE)
+# 
+# summary(auto_sarima_model)
+
+# Auto SARIMA with exogenous variable
+# auto_sarima_model <- auto.arima(close_ts, 
+#                                 xreg = volume_transformed_ts,
+#                                 D=1, # coercing seasonality [@auto-arima-seasonality]
+#                                 #stepwise = TRUE, 
+#                                 approximation = FALSE,
+#                                 trace = TRUE)
+
+## Storing Hyperparameter tuning results for visuals and time savings
+model_names <- c(
+  "ARIMA(2,1,2)(1,1,1)[365]",
+  "ARIMA(0,1,0)(0,1,0)[365]",
+  "ARIMA(1,1,0)(1,1,0)[365]",
+  "ARIMA(0,1,1)(0,1,1)[365]",
+  "ARIMA(0,1,0)(1,1,0)[365]",
+  "ARIMA(0,1,0)(0,1,1)[365]",
+  "ARIMA(0,1,0)(1,1,1)[365]",
+  "ARIMA(1,1,0)(0,1,0)[365]",
+  "ARIMA(1,1,0)(0,1,1)[365]",
+  "ARIMA(1,1,0)(1,1,1)[365]",
+  "ARIMA(2,1,0)(0,1,0)[365]",
+  "ARIMA(2,1,0)(1,1,0)[365]",
+  "ARIMA(2,1,0)(0,1,1)[365]",
+  "ARIMA(2,1,0)(1,1,1)[365]",
+  "ARIMA(3,1,0)(0,1,0)[365]",
+  "ARIMA(2,1,1)(0,1,0)[365]",
+  "ARIMA(1,1,1)(0,1,0)[365]",
+  "ARIMA(3,1,1)(0,1,0)[365]"
+)
+
+aic_values <- c(
+  Inf, 8114.353, Inf, Inf, Inf, Inf, Inf, 8092.992, Inf, Inf, 8077.424, Inf, Inf, Inf, 8079.434, 8079.435, 8084.22, 8081.448
+)
+
+model_df <- data.frame(Model_Type = model_names, AIC = aic_values)
+
+new_model_names <- c(
+  "ARIMA(2,1,2)(1,1,1)[365]",
+  "ARIMA(0,1,0)(0,1,0)[365]",
+  "ARIMA(1,1,0)(1,1,0)[365]",
+  "ARIMA(0,1,1)(0,1,1)[365]",
+  "ARIMA(0,1,0)(1,1,0)[365]",
+  "ARIMA(0,1,0)(0,1,1)[365]",
+  "ARIMA(0,1,0)(1,1,1)[365]",
+  "ARIMA(1,1,0)(0,1,0)[365]",
+  "ARIMA(0,1,1)(0,1,0)[365]",
+  "ARIMA(1,1,1)(0,1,0)[365]"
+)
+
+new_aic_values <- c(
+  Inf, 8115.963, Inf, Inf, Inf, Inf, Inf, Inf, Inf, Inf
+)
+
+model_df_insert <- data.frame(Model_Type = paste(new_model_names, "Volume-Exo."), 
+                              AIC = new_aic_values)
+
+model_df <- rbind(model_df, 
+                  model_df_insert)
+
+new_model_names <- c(
+  "ARIMA(2,1,2)(1,1,1)[365]",
+  "ARIMA(0,1,0)(0,1,0)[365]",
+  "ARIMA(1,1,0)(1,1,0)[365]",
+  "ARIMA(0,1,1)(0,1,1)[365]",
+  "ARIMA(0,1,0)(1,1,0)[365]",
+  "ARIMA(0,1,0)(0,1,1)[365]",
+  "ARIMA(0,1,0)(1,1,1)[365]",
+  "ARIMA(1,1,0)(0,1,0)[365]",
+  "ARIMA(1,1,0)(0,1,1)[365]",
+  "ARIMA(1,1,0)(1,1,1)[365]",
+  "ARIMA(2,1,0)(0,1,0)[365]",
+  "ARIMA(2,1,0)(1,1,0)[365]",
+  "ARIMA(2,1,0)(0,1,1)[365]",
+  "ARIMA(2,1,0)(1,1,1)[365]",
+  "ARIMA(3,1,0)(0,1,0)[365]",
+  "ARIMA(2,1,1)(0,1,0)[365]",
+  "ARIMA(1,1,1)(0,1,0)[365]",
+  "ARIMA(3,1,1)(0,1,0)[365]"
+)
+
+new_aic_values <- c(
+  Inf, 8116.094, Inf, Inf, Inf, Inf, Inf, 8094.909, Inf, Inf, 8079.399, Inf, Inf, Inf, 8081.411, 8081.411, 8086.23, 8083.427
+)
+
+model_df_insert <- data.frame(Model_Type = paste(new_model_names, "Volume-Transformed-Exo"), 
+                           AIC = new_aic_values)
+
+model_df <- rbind(model_df, 
+                        model_df_insert)
+
+new_model_names <- c(
+  "ARIMA(2,1,2)(1,0,1)[365]",
+  "ARIMA(0,1,0)",
+  "ARIMA(1,1,0)(1,0,0)[365]",
+  "ARIMA(0,1,1)(0,0,1)[365]",
+  "ARIMA(0,1,0)",
+  "ARIMA(0,1,0)(1,0,0)[365]",
+  "ARIMA(0,1,0)(0,0,1)[365]",
+  "ARIMA(0,1,0)(1,0,1)[365]",
+  "ARIMA(1,1,0)",
+  "ARIMA(1,1,0)(0,0,1)[365]",
+  "ARIMA(1,1,0)(1,0,1)[365]",
+  "ARIMA(2,1,0)",
+  "ARIMA(2,1,0)(1,0,0)[365]",
+  "ARIMA(2,1,0)(0,0,1)[365]",
+  "ARIMA(2,1,0)(1,0,1)[365]",
+  "ARIMA(3,1,0)",
+  "ARIMA(2,1,1)",
+  "ARIMA(1,1,1)",
+  "ARIMA(3,1,1)",
+  "ARIMA(2,1,0)"
+)
+
+new_aic_values <- c(
+  Inf, Inf, Inf, Inf, 8506.411, Inf, Inf, Inf, 8482.344, Inf, Inf, 8469.105, Inf, Inf, Inf, 8471.009, 8471.03, 8474.147, 8473.022, Inf
+)
+
+model_df_insert <- data.frame(Model_Type = paste(new_model_names, "Volume-Transformed-Exo - 365Optional"), AIC = new_aic_values)
+
+model_df <- rbind(model_df, model_df_insert)
+
+```
+
+As a result of tuning, I found the best ARIMA model for GME forecasting (Figure `r num_figure+1`): 
+
+```{r, fig.width=5, dpi=3600}
+
+# Sort the data by AIC values
+sorted_model_df <- model_df %>%
+  filter(AIC<100000) %>% # remove inf
+  arrange(desc(AIC)) %>% # lower AIC is better
+  distinct(Model_Type, .keep_all = TRUE) %>% # Remove duplicate levels in Model_Type
+  mutate(Model_Type = factor(Model_Type,  # reorder levels
+                                     levels = rev(Model_Type)))
+
+# Create the heatmap-style table with Brewer's color gradient
+plot_hyperparameters <- ggplot(sorted_model_df, 
+       aes(x = "", 
+           y = Model_Type, 
+           fill = AIC)) +
+  geom_tile() +
+  scale_fill_distiller(palette = "RdYlGn", direction = -1)
+
+num_figure <- num_figure + 1
+
+(plot_hyperparameters) +
+  plot_annotation(title = paste0("Figure ",
+                                 num_figure,
+                                 ': GME ARIMA models'))
+
+```
+
+Figure `r num_figure` shows AIC values fall within the 8000s range. While there are subtle distinctions between coerced and non-coerced seasonality, there is generally minor variability among various autoregressions and exogenous variables.
+
+## Model-fitting
+
+Due to the high AIC value (e.g., 8000s), our model may not accurately capture the intricate behavior of GME stock. As a result, we should approach its forecasts cautiously.
+
+```{r}
+best_sarima_model <- Arima(close_ts, 
+                           order = c(2, 1, 0),  # two auto-regressive terms, with differencing once
+                           seasonal = list(order = c(0, 1, 0),  # differencing for stationarity
+                                           period = 365)) # year seasonality
+
+# Forecast
+h <- 180
+forecast_values <- forecast(best_sarima_model, h)
+
+```
+
+```{r}
+forecast_df_raw <- as.data.frame(forecast_values)
+forecast_df <- forecast_df_raw %>%
+  mutate(Date = seq(as.Date("2023-09-27"), by = "1 day", length.out = n()),
+         `Lo 80` = pmax(`Lo 80`,0)) %>%
+  dplyr::select(-c(`Lo 95` , `Hi 95`))
+
+rownames(forecast_df) <- NULL
+
+```
+
+
+```{r, dpi=2200}
+# Find max and min dates
+max_date <- forecast_df$Date[which.max(forecast_df$`Point Forecast`)]
+min_date <- forecast_df$Date[which.min(forecast_df$`Point Forecast`)]
+
+# Create the plot
+plot_forecast <- forecast_df %>%
+  gf_line(`Point Forecast` ~ Date, 
+          color = "black", 
+          alpha = 0.5,
+          linewidth = 1, 
+          ylab = "Closing Price ($)", 
+          xlab="")  %>%
+  gf_line(`Lo 80` ~ Date, color = "red") %>%
+  gf_line(`Hi 80` ~ Date, color = "green") +
+  #geom_vline(xintercept = max_date, color = "black", linetype = "dashed", size = 1) +  # Max line
+  #geom_vline(xintercept = min_date, color = "red", linetype = "dashed", size = 1) +  # Min line
+  annotate("text", x = max_date, y = max(forecast_df$`Point Forecast`), 
+            label = paste0("Max: $", round(max(forecast_df$`Point Forecast`), 1)), 
+            hjust = -0.1, color = "black", size = 3) +  # Annotate max
+   annotate("text", x = min_date, y = min(forecast_df$`Point Forecast`), 
+            label = paste0("Min: $", 
+                           round(min(forecast_df$`Point Forecast`), 1)), 
+            hjust = 1, color = "red", size = 3)  # Annotate min
+
+num_figure <- num_figure + 1
+
+(plot_forecast) +
+  plot_annotation(title = paste0("Figure ",
+                                 num_figure,
+                                 ': GME ARIMA(2,1,0)(0,1,0)[365] forecasting'))
+```
+
+Figure `r num_figure`, shows some interesting information about the forecasting model and expected prices in the future:
+
+- The maximum `Close` price predicted is \$17.90 right now, and the minimum is \$4.90 at the end of the forecast horizon of 6 months. This indicates a pessimistic forecast that the price is just rolling downhill. 
+- Concurrently, the 80% prediction interval [@hyndman2008automatic] on the lower end broached the negative realm, so I had to cut it off at 0; this adds to a pessimistic tale—conversely, the upper bound paints a maximum of around $70 per share, which seems unlikely.
+
+In 2022, GameStop underwent a stock split, quadrupling its supply [@gamestop-stock-split]. This event might have complicated our model, causing disruptions in 'Close' and 'Volume' data despite our mathematical adjustments. Additionally, Figure 2 illustrates the extreme price surge in early 2021, which is challenging for prediction models. Thus, such anomalies should be factored in when evaluating this forecast model.
+
+# Conclusion
+
+The prediction model suggests that selling now is a **reasonable choice**. However, if the model isn't reliable and I sell just before the stock gains significantly, I may miss out on potential profits. Forecasting volatile stocks is very tricky! As liquidity is a concern, I could either (1) sell the necessary amount of GME now and retain the rest for future sales or (2) consider selling all GME and exploring more promising investments. 
+
+\newpage
+# References
